@@ -8,6 +8,10 @@ Pose = namedtuple('Pose', ['x', 'y', 'theta'])
 
 
 class KalmanFilter:
+    """
+    An implementation of the extended Kalman filter with landmarks of known
+    correspondence. Book references are to Probabilistic Robotics 2nd ed.
+    """
     def __init__(self):
         self.last_pose = Pose(0, 0, 0)
         self.last_pose_timestamp = 0
@@ -50,12 +54,8 @@ class KalmanFilter:
         w_t = self.last_w
         theta = self.last_pose.theta
 
-        u_prev = np.array([self.last_pose.x, self.last_pose.y, self.last_pose.theta]).reshape(-1, 1)
-        assert np.isfinite(u_prev).all()
-
         if w_t == 0:
             # Edge case: Going straight
-
             # lim_{w -> 0} v/w (-cos(theta) + cos(theta + dt * w)) = -v * dt * sin(theta)
             # lim_{w -> 0} v/w (-sin(theta) + sin(theta + dt * w)) = v * dt * cos(theta)
             G = np.array([
@@ -73,12 +73,6 @@ class KalmanFilter:
                 [self.dt * np.sin(theta), 0.5 * v_t * self.dt ** 2 * np.cos(theta)],
                 [0, self.dt],
             ])
-
-            u_pred = u_prev + np.array([
-                v_t * self.dt * np.cos(theta),
-                v_t * self.dt * np.sin(theta),
-                w_t * self.dt,
-            ]).reshape(-1, 1)
         else:
             # Normal case: Arc
             vt_over_wt = v_t / w_t
@@ -94,28 +88,26 @@ class KalmanFilter:
             V = np.array([
                 [
                     (-math.sin(theta) + sin_theta_wt_dt) / w_t,
-                    ((v_t * (math.sin(theta) - sin_theta_wt_dt)) / w_t**2) + ((v_t * cos_theta_wt_dt * self.dt) / w_t),  # noqa: E501
+                    (
+                        ((v_t * (math.sin(theta) - sin_theta_wt_dt)) / w_t**2) +
+                        ((v_t * cos_theta_wt_dt * self.dt) / w_t)
+                    ),
                 ],
                 [
                     (math.cos(theta) - cos_theta_wt_dt) / w_t,
-                    ((-v_t * (math.cos(theta) - cos_theta_wt_dt)) / w_t**2) + ((v_t * sin_theta_wt_dt * self.dt) / w_t),  # noqa: E501
+                    (
+                        ((-v_t * (math.cos(theta) - cos_theta_wt_dt)) / w_t**2) +
+                        ((v_t * sin_theta_wt_dt * self.dt) / w_t)
+                    ),
                 ],
                 [0, self.dt],
             ])
 
-            u_pred = u_prev + np.array([
-                -vt_over_wt * math.sin(theta) + vt_over_wt * sin_theta_wt_dt,
-                vt_over_wt * math.cos(theta) - vt_over_wt * cos_theta_wt_dt,
-                w_t * self.dt,
-            ]).reshape(-1, 1)
         assert G.shape == (3, 3)
         assert np.isfinite(G).all()
 
         assert V.shape == (3, 2)
         assert np.isfinite(V).all()
-
-        assert u_pred.shape == (3, 1)
-        assert np.isfinite(u_pred).all()
 
         M = np.array([
             [(self.alphas[0] * (v_t**2)) + (self.alphas[1] * (w_t**2)), 0],
@@ -125,7 +117,10 @@ class KalmanFilter:
         assert np.isfinite(M).all()
 
         # Prediction, L6-7
-        # u_pred move above, since it depends of vt_over_wt
+        # Already have u_pred from the motion model.
+        u_pred = np.array([self.last_pose.x, self.last_pose.y, self.last_pose.theta]).reshape(-1, 1)
+        assert u_pred.shape == (3, 1)
+        assert np.isfinite(u_pred).all()
 
         cov_pred = (G @ self.covariance @ G.T) + (V @ M @ V.T)
         assert cov_pred.shape == (3, 3)
@@ -156,7 +151,6 @@ class KalmanFilter:
 
             # In the edge case calculations are bassically 0 / sqrt(0).
             # lim_{x -> 0} x / sqrt(x) = lim_{x -> 0} sqrt(x) = 0
-            # TODO: We can tune it though if practical performance is bad. We might prefer full-rank array.
             edge_case_x = 0
             edge_case_y = 0
             H = np.array([
@@ -165,7 +159,7 @@ class KalmanFilter:
                 [0, 0, 0],
             ])
 
-            # TODO: arctan2(0, 0), which is undefined. It can be any value 0 through pi/2
+            # arctan2(0, 0), which is undefined. It can be any value 0 through pi/2
             edge_case_atan = 0
             z_expected = np.array([0, edge_case_atan - pred_theta, m_s]).reshape(-1, 1)
         else:
@@ -235,16 +229,16 @@ class TestKalmanFilter(unittest.TestCase):
 
     def test_move_forward(self):
         """
-        What if your controls are just to move forward without turning,
-        and you get perfect observations?
+        If controls are just to move forward without turning and you get
+        perfect observations, the corrected mean should match the motion
+        model exactly.
         """
         kf = KalmanFilter()
-        assert kf is not None
-
         self.assertEqual(kf.last_pose.x, 0)
         self.assertEqual(kf.last_pose.y, 0)
         self.assertEqual(kf.last_pose.theta, 0)
 
+        # Initial motion is ignored, so no pose change.
         kf.motion_model(angular_vel=0, translational_vel=5, timestamp=1)
         self.assertEqual(kf.last_pose.x, 0)
         self.assertEqual(kf.last_pose.y, 0)
@@ -258,12 +252,16 @@ class TestKalmanFilter(unittest.TestCase):
 
         # Let there be a landmark with known correspondence exactly 5m ahead.
         landmark_x, landmark_y = 30, 0
+
         # Now assume there was 0 error, our true pose should be equal to
         # the one produced by the motion model, assuming our sensor measurement
-        # is perfect.
-        kf.covariance = np.zeros((3, 3))
+        # is nearly perfect.
+
+        # Motion model error
         kf.alphas = [0, 0, 0, 0]
-        kf.epsilons = [0, 0, 0, 0]
+        # Sensor model error
+        kf.epsilons = [1/10000, 1/10000, 1/10000, 1/10000]
+
         z_measured = np.array([
             math.sqrt((landmark_x - kf.last_pose.x)**2 + (landmark_y - kf.last_pose.y)**2),
             0,  # No angular change right now
